@@ -2041,6 +2041,11 @@ static void recache_method(
     int orig_in_cache = 0;
     if (mc && tt != NULL) {
         jl_typemap_entry_t *entry = lookup_leafcache(jl_atomic_load_relaxed(&mc->leafcache), (jl_value_t*)tt, world);
+        if (entry && entry->func.linfo->def.method != definition) {
+            // `tt` dispatches to another method; preserve its cache entry.
+            JL_UNLOCK(&mc->writelock);
+            return;
+        }
         if (entry) {
             jl_gc_write_atomic(entry, *(_Atomic(jl_method_instance_t*)*)&entry->func.linfo,
                    jl_method_instance_t, newmeth, release);
@@ -2055,6 +2060,12 @@ static void recache_method(
         struct jl_typemap_assoc search = {tt ? (jl_value_t*)tt : compilationsig, world, NULL};
         assert(cache);
         jl_typemap_entry_t *entry = jl_typemap_assoc_by_type(jl_atomic_load_relaxed(cache), &search, offs, /*subtype*/1);
+        if (entry && entry->func.linfo->def.method != definition) {
+            // Compilation signatures can overlap another method's dispatch region.
+            // Preserve that method's entry and do not insert a competing one.
+            if (mc) JL_UNLOCK(&mc->writelock);
+            return;
+        }
         if (entry && jl_subtype((jl_value_t*)entry->sig, (jl_value_t*)newmeth->specTypes)) {
             jl_gc_write_atomic(entry, *(_Atomic(jl_method_instance_t*)*)&entry->func.linfo,
                    jl_method_instance_t, newmeth, release);

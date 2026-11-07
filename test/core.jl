@@ -8754,6 +8754,16 @@ code_typed(caller63844, ())
 @test f63844(1, 2, 3, 4, 5, 6, (7, 8)) === 2
 @test caller63844() === 2
 
+# Both compilation signatures normalize to the same type.
+# Recording the varargs specialization must preserve dispatch to the tuple method (#64751).
+f_recache_widened(::DataType, ::Tuple) = :tuple
+f_recache_widened(::DataType, xs...) = :varargs
+g_recache_widened(::Vector{T}) where {T<:Union{Float32,Float64}} = f_recache_widened(T, (1, 2))
+h_recache_widened(r) = g_recache_widened(r[])
+code_typed(h_recache_widened, (Ref{Vector{<:Union{Float32,Float64}}},))
+@test f_recache_widened(Float32, (1, 2)) === :tuple
+@test f_recache_widened(Float32, 1, 2) === :varargs
+
 f48950(::Union{Int,d}, ::Union{c,Nothing}...) where {c,d} = 1
 @test f48950(1, 1, 1) == 1
 
