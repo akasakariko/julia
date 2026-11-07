@@ -499,9 +499,31 @@ unsigned jl_tagged_word_tagwidth(jl_value_t *u) JL_NOTSAFEPOINT
 // (jl_field_istagged / arrayelem_istagged), which is the source of truth.
 JL_DLLEXPORT int jl_is_tagged_uniontype(jl_value_t *u) JL_CANSAFEPOINT
 {
-    // no union qualifies until the runtime, the GC, the serializers and
-    // codegen handle tagged words
-    return 0;
+    if (!jl_is_uniontype(u))
+        return 0;
+    unsigned n = jl_count_union_components(u);
+    unsigned nimm = 0, nptr = 0;
+    for (unsigned i = 0; i < n; i++) {
+        jl_value_t *t = jl_nth_union_component(u, i);
+        if (can_be_immediate_component(t))
+            nimm++;
+        else
+            nptr++;
+    }
+    if (nimm == 0 || nimm > 4 || nptr == 0)
+        return 0;
+    // a union that is storable inline (e.g. mixing bits components with
+    // zero-size singletons like Nothing) keeps the selector-byte layout
+    size_t fsz = 0, al = 0;
+    if (jl_islayout_inline(u, &fsz, &al))
+        return 0;
+    unsigned k = tag_width(nimm);
+    for (unsigned i = 0; i < n; i++) {
+        jl_value_t *t = jl_nth_union_component(u, i);
+        if (can_be_immediate_component(t) && jl_datatype_nbits((jl_datatype_t*)t) > TAGGED_WORD_BITS - k)
+            return 0;
+    }
+    return 1;
 }
 
 // the i-th (0-based) immediate component of union `u`, i.e. the component
