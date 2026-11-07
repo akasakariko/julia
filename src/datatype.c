@@ -191,6 +191,7 @@ static int layoutcache_initialized = 0;
 static jl_datatype_layout_t *jl_get_layout(uint32_t sz,
                                            uint32_t nfields,
                                            uint32_t npointers,
+                                           uint32_t ntaggedwords,
                                            uint32_t alignment,
                                            int haspadding,
                                            int isbitsegal,
@@ -245,12 +246,13 @@ static jl_datatype_layout_t *jl_get_layout(uint32_t sz,
     flddesc->flags.fielddesc_type = fielddesc_type;
     flddesc->flags.arrayelem_isboxed = (arrayelem & 1) != 0;
     flddesc->flags.arrayelem_isunion = (arrayelem & 2) != 0;
+    flddesc->flags.arrayelem_istagged = (arrayelem & 16) != 0;
     flddesc->flags.arrayelem_isatomic = (arrayelem & 4) != 0;
     flddesc->flags.arrayelem_islocked = (arrayelem & 8) != 0;
     flddesc->flags.unused_bits = unused_bits;
-    flddesc->flags.padding = 0;
     flddesc->npointers = npointers;
     flddesc->first_ptr = first_ptr;
+    flddesc->ntaggedwords = ntaggedwords;
 
     // fill out the fields of the new descriptor
     jl_fielddesc8_t *desc8 = (jl_fielddesc8_t *)jl_dt_layout_fields(flddesc);
@@ -445,6 +447,95 @@ JL_DLLEXPORT int jl_stored_inline(jl_value_t *eltype)
     return jl_islayout_inline(eltype, &fsz, &al);
 }
 
+// Tagged words: a union mixing reference components with 1..4 small
+// primitive ("immediate") components is stored as a single pointer-sized word:
+//
+//     word == 0                  #undef
+//     word != 0, low bits 00     untagged jl_value_t* (component from heap type tag)
+//     low bit 1                  immediate; the i-th immediate component (0-based,
+//                                in union component order) has tag 2*i + 1 and
+//                                word == (zext(value) << k) | tag
+//     low bits 10                reserved
+//
+// with k = 1 for one immediate component, 2 for two, 3 for three or four. Tags
+// are odd so that the low two bits answer pointer-vs-immediate without knowing
+// the union type, by the same rule the GC applies to JL_GC_PUSH roots; k is
+// only needed to decode a payload. Capping k at 3 keeps 61 payload bits (29 on
+// 32-bit platforms); a wider tag would fit the encoding. The encoding is
+// documented ABI, see doc/src/devdocs/taggedwords.md.
+
+#define TAGGED_WORD_BITS (8 * sizeof(uintptr_t))
+
+// eligible as an immediate component (nbits bound vs. k is checked by the caller)
+STATIC_INLINE int can_be_immediate_component(jl_value_t *t) JL_NOTSAFEPOINT
+{
+    return jl_is_datatype(t) && ((jl_datatype_t*)t)->isprimitivetype &&
+           jl_datatype_nbits((jl_datatype_t*)t) < TAGGED_WORD_BITS;
+}
+
+// tag width k for the given number of immediate components
+STATIC_INLINE unsigned tag_width(unsigned nimmediate) JL_NOTSAFEPOINT
+{
+    return nimmediate == 1 ? 1 : nimmediate == 2 ? 2 : 3;
+}
+
+// tag width k of a union already known (from layout metadata) to be tagged;
+// unlike jl_is_tagged_uniontype this never computes layouts (no safepoints)
+unsigned jl_tagged_word_tagwidth(jl_value_t *u) JL_NOTSAFEPOINT
+{
+    unsigned n = jl_count_union_components(u);
+    unsigned nimm = 0;
+    for (unsigned i = 0; i < n; i++) {
+        if (can_be_immediate_component(jl_nth_union_component(u, i)))
+            nimm++;
+    }
+    assert(nimm > 0 && nimm <= 4);
+    return tag_width(nimm);
+}
+
+// whether `u` is a union stored as a tagged word (all-or-nothing: a union
+// that exceeds the tag budget falls back to the boxed layout).
+// May compute component layouts; at access time, prefer the layout metadata
+// (jl_field_istagged / arrayelem_istagged), which is the source of truth.
+JL_DLLEXPORT int jl_is_tagged_uniontype(jl_value_t *u) JL_CANSAFEPOINT
+{
+    // no union qualifies until the runtime, the GC, the serializers and
+    // codegen handle tagged words
+    return 0;
+}
+
+// the i-th (0-based) immediate component of union `u`, i.e. the component
+// whose values are encoded with tag 2*i + 1
+jl_datatype_t *jl_nth_immediate_component(jl_value_t *u, unsigned i) JL_NOTSAFEPOINT
+{
+    unsigned n = jl_count_union_components(u);
+    for (unsigned j = 0; j < n; j++) {
+        jl_value_t *t = jl_nth_union_component(u, j);
+        if (can_be_immediate_component(t) && i-- == 0)
+            return (jl_datatype_t*)t;
+    }
+    return NULL;
+}
+
+// immediate component index of exactly `t` in union `u` (0 if `t` is a
+// reference component)
+int jl_immediate_component_index(jl_value_t *u, jl_datatype_t *t, unsigned *idx) JL_NOTSAFEPOINT
+{
+    if (!can_be_immediate_component((jl_value_t*)t))
+        return 0;
+    unsigned n = jl_count_union_components(u), imm = 0;
+    for (unsigned j = 0; j < n; j++) {
+        jl_value_t *c = jl_nth_union_component(u, j);
+        if (c == (jl_value_t*)t) {
+            *idx = imm;
+            return 1;
+        }
+        if (can_be_immediate_component(c))
+            imm++;
+    }
+    return 0;
+}
+
 // whether instances of this type can use pointer comparison for `===`
 int jl_pointer_egal(jl_value_t *t)
 {
@@ -534,7 +625,7 @@ static void jl_get_genericmemory_layout(jl_datatype_t *st) JL_CANSAFEPOINT
     }
     if (!jl_is_type(eltype)) {
         // this is expected to have a layout, but since it is not constructable, we don't care too much what it is
-        static const jl_datatype_layout_t opaque_ptr_layout = {0, 0, 1, -1, sizeof(void*), {0}};
+        static const jl_datatype_layout_t opaque_ptr_layout = {0, 0, 1, -1, 0, sizeof(void*), {0}};
         st->layout = &opaque_ptr_layout;
         st->has_concrete_subtype = 0;
         return;
@@ -543,6 +634,7 @@ static void jl_get_genericmemory_layout(jl_datatype_t *st) JL_CANSAFEPOINT
     size_t elsz = 0, al = 1;
     int isunboxed = jl_islayout_inline(eltype, &elsz, &al) && (kind != (jl_value_t*)jl_atomic_sym || jl_is_datatype(eltype));
     int isunion = isunboxed && jl_is_uniontype(eltype);
+    int istagged = !isunboxed && jl_is_tagged_uniontype(eltype);
     int haspadding = 1; // we may want to eventually actually compute this more precisely
     int isbitsegal = 0;
     int nfields = 0; // aka jl_is_layout_opaque
@@ -550,6 +642,7 @@ static void jl_get_genericmemory_layout(jl_datatype_t *st) JL_CANSAFEPOINT
     int zi;
     uint32_t first_ptr = -1;
     uint32_t *pointers = &first_ptr;
+    uint32_t ntaggedwords = 0;
     int needlock = 0;
 
     const jl_datatype_layout_t *el_layout = NULL;
@@ -583,6 +676,7 @@ static void jl_get_genericmemory_layout(jl_datatype_t *st) JL_CANSAFEPOINT
                     }
                 }
             }
+            ntaggedwords = el_layout->ntaggedwords;
         }
         if (needlock) {
             assert(al <= JL_SMALL_BYTE_ALIGNMENT);
@@ -595,8 +689,8 @@ static void jl_get_genericmemory_layout(jl_datatype_t *st) JL_CANSAFEPOINT
             haspadding = 1;
             zi = 1;
             // Adjust pointer offsets to account for the lock at the beginning
+            uint32_t lock_offset_words = lock_offset / sizeof(void*);
             if (first_ptr != -1) {
-                uint32_t lock_offset_words = lock_offset / sizeof(void*);
                 first_ptr += lock_offset_words;
                 for (int j = 0; j < npointers; j++) {
                     pointers[j] += lock_offset_words;
@@ -604,15 +698,23 @@ static void jl_get_genericmemory_layout(jl_datatype_t *st) JL_CANSAFEPOINT
             }
         }
     }
+    else if (istagged) {
+        // one tagged word per element, which is its only pointer
+        elsz = sizeof(void*);
+        al = elsz;
+        zi = 1;
+        first_ptr = 0;
+        ntaggedwords = 1;
+    }
     else {
         elsz = sizeof(void*);
         al = elsz;
         zi = 1;
     }
 
-    // arrayelem is a bitfield: 1=isboxed, 2=isunion, 4=isatomic, 8=islocked
+    // arrayelem is a bitfield: 1=isboxed, 2=isunion, 4=isatomic, 8=islocked, 16=istagged
     int arrayelem = 0;
-    if (!isunboxed)
+    if (!isunboxed && !istagged)
         arrayelem |= 1;  // arrayelem_isboxed
     if (isunion)
         arrayelem |= 2;  // arrayelem_isunion
@@ -621,8 +723,10 @@ static void jl_get_genericmemory_layout(jl_datatype_t *st) JL_CANSAFEPOINT
         if (needlock)
             arrayelem |= 8;  // arrayelem_islocked
     }
+    if (istagged)
+        arrayelem |= 16;  // arrayelem_istagged
     assert(!st->layout);
-    st->layout = jl_get_layout(elsz, nfields, npointers, al, haspadding, isbitsegal, arrayelem, 0, NULL, pointers);
+    st->layout = jl_get_layout(elsz, nfields, npointers, ntaggedwords, al, haspadding, isbitsegal, arrayelem, 0, NULL, pointers);
     st->zeroinit = zi;
     //st->has_concrete_subtype = 1;
     //st->isbitstype = 0;
@@ -682,17 +786,17 @@ void jl_compute_field_offsets(jl_datatype_t *st)
         // if we have no fields, we can trivially skip the rest
         if (st == jl_symbol_type || st == jl_string_type) {
             // opaque layout - heap-allocated blob
-            static const jl_datatype_layout_t opaque_byte_layout = {0, 0, 1, -1, 1, { .isbitsegal=1 }};
+            static const jl_datatype_layout_t opaque_byte_layout = {0, 0, 1, -1, 0, 1, { .isbitsegal=1 }};
             st->layout = &opaque_byte_layout;
             return;
         }
         else if (st == jl_simplevector_type || st == jl_module_type) {
-            static const jl_datatype_layout_t opaque_ptr_layout = {0, 0, 1, -1, sizeof(void*), { .isbitsegal=1 }};
+            static const jl_datatype_layout_t opaque_ptr_layout = {0, 0, 1, -1, 0, sizeof(void*), { .isbitsegal=1 }};
             st->layout = &opaque_ptr_layout;
             return;
         }
         else {
-            static const jl_datatype_layout_t singleton_layout = {0, 0, 0, -1, 1, { .isbitsegal=1 }};
+            static const jl_datatype_layout_t singleton_layout = {0, 0, 0, -1, 0, 1, { .isbitsegal=1 }};
             st->layout = &singleton_layout;
         }
     }
@@ -749,6 +853,7 @@ void jl_compute_field_offsets(jl_datatype_t *st)
         int homogeneous = 1;
         int needlock = 0;
         uint32_t npointers = 0;
+        uint32_t ntagged = 0;
         jl_value_t *firstty = jl_field_type(st, 0);
         for (i = 0; i < nfields; i++) {
             jl_value_t *fld = jl_field_type(st, i);
@@ -796,7 +901,19 @@ void jl_compute_field_offsets(jl_datatype_t *st)
                     if (!zeroinit)
                         zeroinit = ((jl_datatype_t*)layout_fld)->zeroinit;
                     npointers += fld_npointers;
+                    ntagged += ((jl_datatype_t*)layout_fld)->layout->ntaggedwords;
                 }
+            }
+            else if (jl_is_tagged_uniontype(fld)) {
+                // stored as a single tagged word; #undef is the zero word
+                fsz = sizeof(void*);
+                al = fsz;
+                desc[i].isptr = 0;
+                zeroinit = 1;
+                npointers++;
+                ntagged++;
+                // TODO: bits-comparable when every reference component is pointer-egal
+                isbitsegal = 0;
             }
             else {
                 fsz = sizeof(void*);
@@ -862,14 +979,18 @@ void jl_compute_field_offsets(jl_datatype_t *st)
             if (desc[i].isptr)
                 pointers[ptr_i++] = offset;
             else if (jl_is_datatype(layout_fld)) {
-                int j, npointers = ((jl_datatype_t*)layout_fld)->layout->npointers;
-                for (j = 0; j < npointers; j++) {
+                const jl_datatype_layout_t *fld_layout = ((jl_datatype_t*)layout_fld)->layout;
+                uint32_t j;
+                for (j = 0; j < fld_layout->npointers; j++) {
                     pointers[ptr_i++] = offset + jl_ptr_offset((jl_datatype_t*)layout_fld, j);
                 }
             }
+            else if (jl_is_tagged_uniontype(fld)) {
+                pointers[ptr_i++] = offset;
+            }
         }
         assert(ptr_i == npointers);
-        st->layout = jl_get_layout(sz, nfields, npointers, alignm, haspadding, isbitsegal, 0, 0, desc, pointers);
+        st->layout = jl_get_layout(sz, nfields, npointers, ntagged, alignm, haspadding, isbitsegal, 0, 0, desc, pointers);
         if (should_malloc) {
             free(desc);
             if (npointers)
@@ -1047,7 +1168,7 @@ JL_DLLEXPORT jl_datatype_t *jl_new_primitivetype(jl_value_t *name, jl_module_t *
     // how C lays out `_BitInt(N)`.
     uint32_t size = LLT_ALIGN(nbytes, alignm);
     uint8_t unused_bits = (uint8_t)(size * 8 - nbits);
-    bt->layout = jl_get_layout(size, 0, 0, alignm, unused_bits != 0, 1, 0, unused_bits, NULL, NULL);
+    bt->layout = jl_get_layout(size, 0, 0, 0, alignm, unused_bits != 0, 1, 0, unused_bits, NULL, NULL);
     bt->instance = NULL;
     return bt;
 }
@@ -1069,13 +1190,14 @@ JL_DLLEXPORT jl_datatype_t * jl_new_foreign_type(jl_sym_t *name,
     layout->nfields = 0;
     layout->alignment = sizeof(void *);
     layout->npointers = haspointers;
+    layout->ntaggedwords = 0;
     layout->flags.haspadding = 1;
     layout->flags.isbitsegal = 0;
     layout->flags.fielddesc_type = JL_FIELDDESC_FOREIGN;
     layout->flags.unused_bits = 0;
-    layout->flags.padding = 0;
     layout->flags.arrayelem_isboxed = 0;
     layout->flags.arrayelem_isunion = 0;
+    layout->flags.arrayelem_istagged = 0;
     layout->flags.arrayelem_isatomic = 0;
     layout->flags.arrayelem_islocked = 0;
     jl_fielddescdyn_t * desc =
