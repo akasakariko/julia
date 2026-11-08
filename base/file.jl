@@ -804,22 +804,28 @@ function _tempname(parent::AbstractString, suffix::AbstractString, max_tries::In
 end
 
 if Sys.iswindows()
-# While this isn't a true analog of `mkstemp`, it _does_ create an
-# empty file for us, ensuring that other simultaneous calls to
-# `_win_mkstemp()` won't collide, so it's a better name for the
-# function than `tempname()`.
+# Create an empty file with a random name and return its path.
+# GetTempFileNameW is not used: when other processes create temporary files in
+# the same directory, it can return a name this process deleted just before.
 function _win_mkstemp(temppath::AbstractString)
-    tempp = cwstring(temppath)
-    temppfx = cwstring(temp_prefix)
-    tname = Vector{UInt16}(undef, 32767)
-    uunique = ccall(:GetTempFileNameW, stdcall, UInt32,
-                    (Ptr{UInt16}, Ptr{UInt16}, UInt32, Ptr{UInt16}),
-                    tempp, temppfx, UInt32(0), tname)
-    windowserror("GetTempFileName", uunique == 0)
-    lentname = something(findfirst(iszero, tname))
-    @assert lentname > 0 "unexpected index"
-    resize!(tname, lentname - 1)
-    return transcode(String, tname)
+    req = Libc.malloc(_sizeof_uv_fs)
+    try
+        ccall(:uv_fs_mkstemp, Cint,
+              (Ptr{Cvoid}, Ptr{Cvoid}, Cstring, Ptr{Cvoid}),
+              C_NULL, req, joinpath(temppath, temp_prefix * "XXXXXX"), C_NULL)
+        # the result is the file handle, or a negative error code
+        handle = ccall(:uv_fs_get_result, Cssize_t, (Ptr{Cvoid},), req)
+        if handle < 0
+            uv_fs_req_cleanup(req)
+            uv_error("mktemp($(repr(temppath)))", handle)
+        end
+        path = unsafe_string(ccall(:jl_uv_fs_t_path, Cstring, (Ptr{Cvoid},), req))
+        uv_fs_req_cleanup(req)
+        close(File(OS_HANDLE(Ptr{Cvoid}(handle))))
+        return path
+    finally
+        Libc.free(req)
+    end
 end
 
 function mktemp(parent::AbstractString=tempdir(); cleanup::Bool=true)
